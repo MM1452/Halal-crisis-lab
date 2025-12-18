@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 from datetime import datetime
 
 # --- 1. PAGE CONFIGURATION & STYLING ---
@@ -108,11 +109,11 @@ with st.sidebar.expander("4. Investment Strategy", expanded=False):
     initial_cap = st.number_input(f"Initial Capital ({curr_sym})", 1000, 1000000, 10000, step=1000)
     monthly_add = st.number_input(f"Monthly Add ({curr_sym})", 0, 10000, 500, step=100) if "DCA" in strategy else 0
 
-# --- 4. DATA ENGINE (FIXED FOR CLOUD) ---
+# --- 4. DATA ENGINE (STEALTH MODE ENABLED) ---
 @st.cache_data
 def fetch_data(scenario, h_ticker, use_gbp):
     """
-    Fetches Market Data with robust error handling for Streamlit Cloud.
+    Fetches Market Data using a 'Session' to bypass Yahoo Rate Limits.
     """
     start_str, end_str = SCENARIO_CONTEXT[scenario]["dates"]
     if end_str == "TODAY":
@@ -120,35 +121,39 @@ def fetch_data(scenario, h_ticker, use_gbp):
     
     tickers = ['SPY', h_ticker, '^TNX', 'XLK'] 
     
+    # --- STEALTH MODE: Create a session that looks like a browser ---
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    })
+    # ---------------------------------------------------------------
+
     try:
-        # Download core data
-        df = yf.download(tickers, start=start_str, end=end_str, progress=False, auto_adjust=False)
+        # Pass the 'session' to yfinance
+        df = yf.download(tickers, start=start_str, end=end_str, progress=False, auto_adjust=False, session=session)
         
         # 1. Handle Empty Download
         if df.empty:
-            st.error(f"⚠️ Market data download failed for {start_str} to {end_str}. Yahoo Finance might be blocking the request.")
+            st.error(f"⚠️ Market data download failed. Yahoo Finance is blocking the request. Please wait 15 minutes and try again.")
             st.stop()
 
         # 2. Handle MultiIndex (New yfinance behavior)
         if isinstance(df.columns, pd.MultiIndex):
-            # Try to grab 'Adj Close', fallback to 'Close'
             try:
                 df = df['Adj Close']
             except KeyError:
                 try:
                     df = df['Close']
                 except KeyError:
-                    # Last resort fallback
                     df = df.droplevel(0, axis=1)
         
-        # 3. Fill basic gaps immediately
+        # 3. Fill basic gaps
         df = df.ffill()
 
         # 4. GBP Logic (SAFE MERGE)
         if use_gbp:
-            fx = yf.download("GBPUSD=X", start=start_str, end=end_str, progress=False)
+            fx = yf.download("GBPUSD=X", start=start_str, end=end_str, progress=False, session=session) # Use session here too!
             
-            # Handle FX MultiIndex
             if isinstance(fx.columns, pd.MultiIndex):
                 fx = fx['Adj Close'] if 'Adj Close' in fx.columns else fx['Close']
             else:
@@ -159,24 +164,20 @@ def fetch_data(scenario, h_ticker, use_gbp):
                  df['FX'] = 1.0
             else:
                 fx.name = "FX"
-                # Use LEFT JOIN to preserve stock data even if FX is missing
                 df = df.join(fx, how='left')
-                df['FX'] = df['FX'].ffill().fillna(1.0) # Fill gaps with 1.0
+                df['FX'] = df['FX'].ffill().fillna(1.0)
                 
-                # Apply conversion
                 for col in ['SPY', h_ticker, 'XLK']:
                     if col in df.columns:
                         df[col] = df[col] / df['FX']
         
-        # 5. Risk Free Rate (SAFE FILL)
+        # 5. Risk Free Rate
         if '^TNX' in df.columns:
-            # Fill missing Treasury data with 4% default to prevent crashing
             df['RiskFree_Daily'] = (df['^TNX'].ffill().fillna(4.0) / 100) / 252
         else:
             df['RiskFree_Daily'] = 0.04 / 252
         
-        # 6. Final Clean (Targeted Drop)
-        # Only drop if the ESSENTIAL assets are missing
+        # 6. Final Clean
         df = df.dropna(subset=['SPY', h_ticker])
         
         return df
@@ -211,7 +212,6 @@ def run_simulation(data, initial, monthly, is_dca, h_ticker, inflation_r, apply_
     sim['Cash_Invested'] = initial
     
     if not is_dca:
-        # These lines caused the error, but the SAFETY CHECK above prevents it now.
         sim['Norm_H'] = sim[h_ticker] / sim[h_ticker].iloc[0]
         sim['Norm_S'] = sim['SPY'] / sim['SPY'].iloc[0]
         
