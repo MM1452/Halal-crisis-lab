@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import requests
 from datetime import datetime
 
 # --- 1. PAGE CONFIGURATION & STYLING ---
@@ -14,7 +13,7 @@ st.set_page_config(
     page_icon="🛡️"
 )
 
-# Custom CSS for "Report" style
+# Custom CSS
 st.markdown("""
 <style>
     .metric-box {
@@ -85,8 +84,6 @@ with st.sidebar.expander("2. Asset & Currency", expanded=True):
 # C. The "Skeptic" Toggles
 with st.sidebar.expander("3. Reality Checks (Advanced)", expanded=True):
     st.caption("Apply real-world friction to the simulation.")
-    
-    # Slider for Inflation (Educational Control)
     inflation_input = st.slider(
         "Inflation Rate (Annual %)", 
         min_value=0.0, max_value=15.0, 
@@ -96,11 +93,10 @@ with st.sidebar.expander("3. Reality Checks (Advanced)", expanded=True):
     )
     inflation_rate = inflation_input / 100
 
-    # "Cost of Conscience" (Fees)
     apply_fees = st.checkbox(
         "Apply 'Cost of Conscience' (Fees + Purification)", 
         value=False, 
-        help="Simulates a 0.55% total drag (0.50% Expense Ratio + 0.05% Purification). Halal funds are generally more expensive than SPY (0.09%)."
+        help="Simulates a 0.55% total drag."
     )
 
 # D. Strategy Logic
@@ -109,11 +105,11 @@ with st.sidebar.expander("4. Investment Strategy", expanded=False):
     initial_cap = st.number_input(f"Initial Capital ({curr_sym})", 1000, 1000000, 10000, step=1000)
     monthly_add = st.number_input(f"Monthly Add ({curr_sym})", 0, 10000, 500, step=100) if "DCA" in strategy else 0
 
-# --- 4. DATA ENGINE (STEALTH MODE ENABLED) ---
+# --- 4. DATA ENGINE (CLEAN & ROBUST) ---
 @st.cache_data
 def fetch_data(scenario, h_ticker, use_gbp):
     """
-    Fetches Market Data using a 'Session' to bypass Yahoo Rate Limits.
+    Fetches Market Data using standard yfinance with error handling.
     """
     start_str, end_str = SCENARIO_CONTEXT[scenario]["dates"]
     if end_str == "TODAY":
@@ -121,23 +117,16 @@ def fetch_data(scenario, h_ticker, use_gbp):
     
     tickers = ['SPY', h_ticker, '^TNX', 'XLK'] 
     
-    # --- STEALTH MODE: Create a session that looks like a browser ---
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    })
-    # ---------------------------------------------------------------
-
     try:
-        # Pass the 'session' to yfinance
-        df = yf.download(tickers, start=start_str, end=end_str, progress=False, auto_adjust=False, session=session)
+        # Standard download - let yfinance handle the session internally
+        df = yf.download(tickers, start=start_str, end=end_str, progress=False, auto_adjust=False)
         
-        # 1. Handle Empty Download
+        # 1. Handle Empty Download (Rate Limit or Connection)
         if df.empty:
-            st.error(f"⚠️ Market data download failed. Yahoo Finance is blocking the request. Please wait 15 minutes and try again.")
-            st.stop()
+            st.warning(f"⚠️ Yahoo Finance returned no data. You might be Rate Limited. Please wait 15 minutes and refresh.")
+            return None # Return None instead of crashing
 
-        # 2. Handle MultiIndex (New yfinance behavior)
+        # 2. Handle MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df = df['Adj Close']
@@ -152,7 +141,7 @@ def fetch_data(scenario, h_ticker, use_gbp):
 
         # 4. GBP Logic (SAFE MERGE)
         if use_gbp:
-            fx = yf.download("GBPUSD=X", start=start_str, end=end_str, progress=False, session=session) # Use session here too!
+            fx = yf.download("GBPUSD=X", start=start_str, end=end_str, progress=False)
             
             if isinstance(fx.columns, pd.MultiIndex):
                 fx = fx['Adj Close'] if 'Adj Close' in fx.columns else fx['Close']
@@ -189,26 +178,23 @@ def fetch_data(scenario, h_ticker, use_gbp):
 # Load Data
 df_market = fetch_data(period_name, h_sym, "GBP" in currency_mode)
 
-# --- SAFETY CHECK (PREVENTS INDEX ERROR) ---
+# --- SAFETY CHECK ---
 if df_market is None or df_market.empty or len(df_market) < 2:
-    st.error(f"⚠️ Insufficient data loaded for {h_sym}. The data source returned an empty or incomplete table. Please try selecting a different Date Range or refresh the page.")
+    st.error(f"⚠️ Insufficient data. This is likely a Yahoo Finance Rate Limit (Too many refreshes). Please stop refreshing and wait 15-30 minutes for the block to lift.")
     st.stop()
 
 # --- 5. CALCULATION ENGINE ---
 def run_simulation(data, initial, monthly, is_dca, h_ticker, inflation_r, apply_fees):
-    """
-    Calculates Wealth, Returns, Sharpe, Sortino, and Drawdowns.
-    """
     sim = data.copy()
     
-    # 1. Drag Factors (Daily)
+    # Drag Factors
     inf_drag = inflation_r / 252
-    fee_drag = (0.0055 / 252) if apply_fees else 0 # 0.55% annual drag
+    fee_drag = (0.0055 / 252) if apply_fees else 0 
     
     total_h_drag = inf_drag + fee_drag
     total_s_drag = inf_drag 
     
-    # 2. Wealth Simulation
+    # Wealth Simulation
     sim['Cash_Invested'] = initial
     
     if not is_dca:
@@ -250,7 +236,7 @@ def run_simulation(data, initial, monthly, is_dca, h_ticker, inflation_r, apply_
         sim[f'Port_{h_ticker}'] = (sim['Units_H'] * sim[h_ticker]) * sim['Drag_H']
         sim['Port_SPY'] = (sim['Units_S'] * sim['SPY']) * sim['Drag_S']
 
-    # 3. Returns
+    # Returns
     sim['Ret_H'] = sim[f'Port_{h_ticker}'].pct_change()
     sim['Ret_S'] = sim['Port_SPY'].pct_change()
     
@@ -266,32 +252,26 @@ invested = df_sim['Cash_Invested'].iloc[-1]
 ret_h = (final_h / invested) - 1
 ret_s = (final_s / invested) - 1
 
-# A. Max Drawdown (The "Pain" Index)
+# Max Drawdown
 dd_h_series = (df_sim[f'Port_{h_sym}'] / df_sim[f'Port_{h_sym}'].cummax()) - 1
 max_dd_h = dd_h_series.min()
 
 dd_s_series = (df_sim['Port_SPY'] / df_sim['Port_SPY'].cummax()) - 1
 max_dd_s = dd_s_series.min()
 
-# B. Risk Metrics (Sharpe vs Sortino)
+# Risk Metrics
 def calc_risk_metrics(series, risk_free):
     excess = series - risk_free
-    
-    # Sharpe (Total Volatility)
     sharpe = (excess.mean() / excess.std()) * (252**0.5) if excess.std() != 0 else 0
-    
-    # Sortino (Downside Volatility only)
     downside = excess[excess < 0]
     sortino = (excess.mean() / downside.std()) * (252**0.5) if downside.std() != 0 else 0
-    
     return sharpe, sortino
 
 sharpe_h, sortino_h = calc_risk_metrics(df_sim['Ret_H'], df_market['RiskFree_Daily'])
 sharpe_s, sortino_s = calc_risk_metrics(df_sim['Ret_S'], df_market['RiskFree_Daily'])
 
 
-# --- 7. DASHBOARD & INSIGHTS ---
-
+# --- 7. DASHBOARD ---
 st.title(f"🛡️ Halal Crisis Lab: {period_name}")
 
 st.markdown(f"""
@@ -301,7 +281,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# A. Metrics Row (5 Columns for Depth)
+# Metrics
 c1, c2, c3, c4, c5 = st.columns(5)
 
 def metric_html(label, value, sub, color, tooltip):
@@ -326,13 +306,12 @@ with c4:
     col = "#e74c3c" if max_dd_h < -0.20 else "black"
     st.markdown(metric_html("Max Pain (Drawdown)", f"{max_dd_h:.1%}", f"vs Mrkt: {max_dd_s:.1%}", col, "The single worst drop from the peak value."), unsafe_allow_html=True)
 with c5:
-    # Showing Sortino as primary, Sharpe as context
     col = "#2ecc71" if sortino_h > sortino_s else "#e74c3c"
     st.markdown(metric_html("Risk Efficiency", f"{sortino_h:.2f}", f"Sharpe: {sharpe_h:.2f}", col, "Main: Sortino (Downside Risk). Sub: Sharpe (Total Risk)."), unsafe_allow_html=True)
 
 st.markdown("---")
 
-# B. Visual Analytics
+# Visuals
 tab1, tab2, tab3 = st.tabs(["📈 Wealth Curve & Tech Correlation", "🧠 The Pro's Desk (Risk Deep Dive)", "🧬 Sector Skew"])
 
 with tab1:
@@ -340,87 +319,44 @@ with tab1:
     show_tech = st.checkbox("Overlay Tech Sector (XLK) - See the correlation", value=False)
     
     fig = go.Figure()
-    
-    # Main Portfolio Lines
     fig.add_trace(go.Scatter(x=df_sim.index, y=df_sim[f'Port_{h_sym}'], name=f'Halal ({h_sym})', line=dict(color='#2ecc71', width=3)))
     fig.add_trace(go.Scatter(x=df_sim.index, y=df_sim['Port_SPY'], name='S&P 500', line=dict(color='gray', width=2)))
     
-    # Tech Overlay
     if show_tech:
         norm_xlk = (df_market['XLK'] / df_market['XLK'].iloc[0]) * initial_cap
         fig.add_trace(go.Scatter(x=df_market.index, y=norm_xlk, name='Tech (XLK) Proxy', line=dict(color='#9b59b6', dash='dot', width=2), opacity=0.7))
 
     fig.add_trace(go.Scatter(x=df_sim.index, y=df_sim['Cash_Invested'], name='Cash Invested', line=dict(color='blue', dash='dash', width=1)))
-    
     y_label = "Real Value (Purchasing Power)" if inflation_rate > 0 else f"Portfolio Value ({curr_sym})"
     fig.update_layout(yaxis_title=y_label, hovermode="x unified")
-    
     st.plotly_chart(fig, use_container_width=True)
-    if show_tech:
-        st.info(f"💡 **Visual Evidence:** Notice the correlation. When the Purple Line (Tech) drops, the Green Line (Halal) almost always follows. This visually confirms the 'Sector Skew' theory.")
 
 with tab2:
     st.markdown("#### 🧠 Advanced Risk Analysis")
-    st.markdown("This section compares **Total Volatility (Sharpe)** vs **Bad Volatility (Sortino)**.")
-    
-    # Comparison Table
     risk_data = pd.DataFrame({
         "Metric": ["Sharpe Ratio (Total Volatility)", "Sortino Ratio (Downside Risk)", "Max Drawdown"],
         f"Halal ({h_sym})": [f"{sharpe_h:.2f}", f"{sortino_h:.2f}", f"{max_dd_h:.1%}"],
         "S&P 500": [f"{sharpe_s:.2f}", f"{sortino_s:.2f}", f"{max_dd_s:.1%}"],
     })
     st.table(risk_data.set_index("Metric"))
-    
-    st.markdown("""
-    **How to read this:**
-    * **If Sortino > Sharpe:** The volatility is mostly "upside" (sudden price jumps). This is "Good Volatility."
-    * **If Sortino < Sharpe:** The volatility is mostly "downside" (crashes). This is "Bad Volatility."
-    * **The Pro's Take:** Halal funds often have higher volatility (Beta) due to lack of diversification (No Banks), but if the Sortino is high, that volatility was profitable.
-    """)
 
 with tab3:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("The 'Sector Skew' Explanation")
-        st.markdown("""
-        **The 'Accidental' Tech Fund:**
-        Because Islamic Finance prohibits interest (Riba), these funds cannot hold Financials.
-        The capital naturally flows into **Technology** to fill the gap.
-        """)
-        
         skew_data = pd.DataFrame({
             "Sector": ["Technology", "Healthcare", "Financials (Banks)", "Energy/Other"],
             "Halal_Weight": [45, 20, 0, 35],
             "SP500_Weight": [28, 13, 13, 46]
         })
-        
         fig_skew = go.Figure(data=[
             go.Bar(name='Halal Fund', x=skew_data['Sector'], y=skew_data['Halal_Weight'], marker_color='#2ecc71'),
             go.Bar(name='S&P 500', x=skew_data['Sector'], y=skew_data['SP500_Weight'], marker_color='gray')
         ])
         fig_skew.update_layout(barmode='group')
         st.plotly_chart(fig_skew, use_container_width=True)
-        
     with c2:
-        st.info("""
-        **Historical Impact:**
-        
-        * **2020 (Covid):** Tech boomed. Halal funds outperformed.
-        * **2022 (Inflation):** Rates rose. Banks profited. Tech crashed. Halal funds suffered due to 0% Bank exposure.
-        """)
+        st.info("Because Islamic Finance prohibits interest (Riba), these funds cannot hold Financials. The capital naturally flows into Technology to fill the gap.")
 
-# --- 8. PROFESSOR'S COMMENTARY ---
 with st.expander("🎓 Professor's Commentary: How to read this analysis", expanded=False):
-    st.markdown(f"""
-    **1. The 'Sortino' vs 'Sharpe' Debate:**
-    We show both in the 'Pro's Desk'. 
-    * **Sharpe** asks: "Was the ride bumpy?"
-    * **Sortino** asks: "Did the bumps actually hurt?"
-    
-    **2. The Inflation Trap:**
-    You set inflation to **{inflation_rate*100:.1f}%**. 
-    If your 'Real Return' is negative, it means your money grew slower than the cost of living. You "made money" on paper, but **lost wealth** in reality.
-    
-    **3. The Fee Drag:**
-    If you enabled 'Cost of Conscience', you're seeing the impact of the ~0.50% expense ratio. Over 20 years, this fee drag can eat significant wealth, which is the price of ethical compliance.
-    """)
+    st.markdown(f"**The Inflation Trap:** You set inflation to **{inflation_rate*100:.1f}%**. If 'Real Return' is negative, you lost wealth in reality.")
